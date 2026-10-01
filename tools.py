@@ -30,9 +30,6 @@ def web_search(query: str) -> str:
 
     return "\n----\n".join(out)
 
-print(web_search.invoke("Latest news related to Autodesk company"))
-
-
 @tool
 def scrape_url(url: str) -> str:
     """Scrape and return clean text content from a given URL for deeper reading."""
@@ -47,3 +44,8 @@ def scrape_url(url: str) -> str:
         return soup.get_text(separator=" ", strip=True)[:3000]
     except Exception as e:
         return f"Could not scrape URL: {str(e)}"
+
+tool_list = [
+    web_search,
+    scrape_url
+]
