@@ -1,0 +1,83 @@
+# =========================
+# Environment / Secrets
+# =========================
+.env
+.env.*
+!.env.example
+
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Python packaging
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# =========================
+# Jupyter Notebook
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# IDE / Editors
+# =========================
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# =========================
+# OS Generated Files
+# =========================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# =========================
+# Logs
+# =========================
+*.log
+logs/
+
+# =========================
+# Project Data / Cache
+# =========================
+data/
+cache/
+.tmp/
+temp/
+
+# =========================
+# Generated Research Outputs
+# =========================
+outputs/
+reports/
+research_results/
+
+# =========================
+# Vector Databases / Local DB
+# =========================
+chroma/
+chromadb/
+*.db
+*.sqlite
+*.sqlite3
+
+# =========================
+# Testing / Coverage
+# =========================
+.pytest_cache/
+.coverage
+htmlcov/
+.coverage.*
