@@ -61,11 +61,17 @@ WRITER_PROMPT = ChatPromptTemplate.from_messages([
     Research Gathered:
     {research}
 
+    Previous Critique:
+    {critique}
+
     Structure the report as:
     - Introduction
     - Key Findings (minimum 3 well-explained points)
     - Conclusion
     - Sources (list all URLs found in the research)
+
+    If a previous critique is provided, revise the report according to
+    the critique. If no critique is provided, write the initial report.
 
     Be detailed, factual and professional."""),
 ])
@@ -91,5 +97,12 @@ CRITIC_PROMPT = ChatPromptTemplate.from_messages([
     - ...
 
     One line verdict:
-    ..."""),
+    ...
+
+    VERDICT: APPROVED
+    or
+    VERDICT: REVISE
+
+    Use APPROVED only if the report is sufficiently accurate, well-supported,
+    complete, and well-written. Otherwise, use REVISE."""),
 ])

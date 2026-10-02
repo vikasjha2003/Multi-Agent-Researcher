@@ -1,11 +1,11 @@
 # Imports
-import os
 from typing import TypedDict, Annotated
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
-from langgraph.graph import StateGraph , START, END
+from langgraph.graph import StateGraph, START, END
 from langchain_groq import ChatGroq
-from langchain_core.messages import ToolMessage
+from langchain_core.messages import ToolMessage, AIMessage
+from groq import BadRequestError
 from rich import print
 
 import tools as custom_tools
@@ -13,87 +13,119 @@ import prompts
 from dotenv import load_dotenv
 load_dotenv()
 
-#tools
-
+# Tools
 searcher_tools = [custom_tools.web_search]
 reader_tools = [custom_tools.scrape_url]
 
-# States
-class State(TypedDict) :
-    topic : str
-    messages : Annotated[list,add_messages]
-    searcher : str
-    reader : str
-    writer : str
-    critic : str
+MAX_TOOL_ROUNDS = 1
+MAX_WRITE_ATTEMPTS = 3
 
-# Mdoel / llm
+
+# State
+class State(TypedDict):
+    topic: str
+    messages: Annotated[list, add_messages]
+
+    searcher: str
+    reader: str
+    writer: str
+    critic: str
+
+    is_approved: bool
+    attempt: int
+    search_attempts: int
+    read_attempts: int
+    reader_start: int  
+
+
+# Model / LLM
 llm = ChatGroq(model="openai/gpt-oss-120b")
 searcher_llm = llm.bind_tools(tools=searcher_tools)
 reader_llm = llm.bind_tools(tools=reader_tools)
 
+
+def safe_tool_invoke(model, messages):
+    """Invoke a tool-bound model. If the model tries to call a tool that
+    isn't in our list (gpt-oss has built-ins like web_open), Groq returns a
+    400 'tool_use_failed'. Treat that as 'no more tool calls'."""
+    try:
+        return model.invoke(messages)
+    except BadRequestError as e:
+        if "tool_use_failed" in str(e):
+            return AIMessage(content="Finished gathering information.")
+        raise
+
+
 # Nodes
 def searcher_node(state: State):
-    topic = state["topic"]
+    prompt_msgs = prompts.SEARCH_PROMPT.invoke({"topic": state["topic"]}).to_messages()
+    attempts = state.get("search_attempts", 0)
 
-    messages = prompts.SEARCH_PROMPT.invoke({
-        "topic": topic
-    })
+    if attempts >= MAX_TOOL_ROUNDS:
+        return {
+            "messages": [AIMessage(content="Search complete.")],
+            "search_attempts": attempts + 1,
+        }
 
-    response = searcher_llm.invoke(messages)
+    response = safe_tool_invoke(searcher_llm, prompt_msgs + state["messages"])
 
     return {
-        "messages": [response]
+        "messages": [response],
+        "search_attempts": attempts + 1,
     }
+
 
 searcher_tool_node = ToolNode(tools=searcher_tools)
 
+
 def extract_search_results_node(state: State):
-
-    search_results = []
-
-    for message in state["messages"]:
-        if isinstance(message, ToolMessage):
-            search_results.append(message.content)
+    search_results = [
+        m.content for m in state["messages"] if isinstance(m, ToolMessage)
+    ]
 
     return {
-        "searcher": "\n\n".join(search_results)
+        "searcher": "\n\n".join(search_results),
+        "reader_start": len(state["messages"]),
     }
 
-def reader_node(state: State) :
-    topic = state["topic"]
-    search_results = state["searcher"]
 
-    messages = prompts.READER_PROMPT.invoke({
-        "topic" : topic,
-        "search_results" : search_results
-    })
+def reader_node(state: State):
+    prompt_msgs = prompts.READER_PROMPT.invoke({
+        "topic": state["topic"],
+        "search_results": state["searcher"],
+    }).to_messages()
 
-    response = reader_llm.invoke(messages)
+    attempts = state.get("read_attempts", 0)
+    history = state["messages"][state.get("reader_start", 0):]
+
+    if attempts >= MAX_TOOL_ROUNDS:
+        return {
+            "messages": [AIMessage(content="Reading complete.")],
+            "read_attempts": attempts + 1,
+        }
+
+    response = safe_tool_invoke(reader_llm, prompt_msgs + history)
 
     return {
-        "messages" : [response]
+        "messages": [response],
+        "read_attempts": attempts + 1,
     }
+
 
 reader_tool_node = ToolNode(tools=reader_tools)
 
+
 def extract_reader_results_node(state: State):
+    reader_results = [
+        m.content
+        for m in state["messages"]
+        if isinstance(m, ToolMessage) and m.name == "scrape_url"
+    ]
 
-    reader_results = []
+    return {"reader": "\n\n---\n\n".join(reader_results)}
 
-    for message in state["messages"]:
-        if (
-            isinstance(message, ToolMessage)
-            and message.name == "scrape_url"
-        ):
-            reader_results.append(message.content)
 
-    return {
-        "reader": "\n\n---\n\n".join(reader_results)
-    }
-
-def writer_node (state : State) :
-    topic = state["topic"]
+def writer_node(state: State):
     research = (
         f"SEARCH RESULTS:\n\n"
         f"{state['searcher']}\n\n"
@@ -102,116 +134,146 @@ def writer_node (state : State) :
     )
 
     messages = prompts.WRITER_PROMPT.invoke({
-        "topic": topic,
-        "research": research
+        "topic": state["topic"],
+        "research": research,
+        "critique": state["critic"],
     })
 
     response = llm.invoke(messages)
 
     return {
-        "writer": response.content
+        "writer": response.content,
+        "attempt": state["attempt"] + 1,
     }
 
-# Routers
-def searcher_router(state : State) :
-    last_message = state["messages"][-1]
-
-    if getattr(last_message, "tool_calls", None):
-        if len(state["messages"]) >= 8:
-            return "extract_search_result"
-        return "search_tool"
-
-    return "extract_search_result"
-
-def reader_router(state : State) :
-    last_message = state["messages"][-1]
-
-    if getattr(last_message, "tool_calls", None):
-        if len(state["messages"]) >= 10:
-            return "extract_read_result"
-        return "read_tool"
-
-    return "extract_read_result"
 
 def critic_node(state: State):
-    report = state["writer"]
-
-    messages = prompts.CRITIC_PROMPT.invoke({
-        "report": report
-    })
+    messages = prompts.CRITIC_PROMPT.invoke({"report": state["writer"]})
 
     response = llm.invoke(messages)
+    review_text = response.content.strip()
 
-    return {"critic": response.content}
+    last_line = review_text.splitlines()[-1].upper() if review_text else ""
+    is_approved = "VERDICT: APPROVED" in last_line
 
-# Graph Creation
+    return {
+        "critic": review_text,
+        "is_approved": is_approved,
+    }
+
+
+# Routers
+def searcher_router(state: State):
+    if getattr(state["messages"][-1], "tool_calls", None):
+        return "search_tool"
+    return "extract_search_result"
+
+
+def reader_router(state: State):
+    if getattr(state["messages"][-1], "tool_calls", None):
+        return "read_tool"
+    return "extract_read_result"
+
+
+def critic_router(state: State):
+    if state["is_approved"] or state["attempt"] >= MAX_WRITE_ATTEMPTS:
+        return "end"
+    return "revise"
+
+
+# Graph creation
 graph = StateGraph(State)
 
-# Adding Nodes
-graph.add_node("searcher",searcher_node)
-graph.add_node("search_tool",searcher_tool_node)
-graph.add_node("extract_search_result",extract_search_results_node)
+# Adding nodes
+graph.add_node("searcher", searcher_node)
+graph.add_node("search_tool", searcher_tool_node)
+graph.add_node("extract_search_result", extract_search_results_node)
 
-graph.add_node("reader",reader_node)
-graph.add_node("read_tool",reader_tool_node)
-graph.add_node("extract_read_result",extract_reader_results_node)
+graph.add_node("reader", reader_node)
+graph.add_node("read_tool", reader_tool_node)
+graph.add_node("extract_read_result", extract_reader_results_node)
 
-graph.add_node("writer",writer_node)
+graph.add_node("writer", writer_node)
+graph.add_node("critic", critic_node)
 
-graph.add_node("critic",critic_node)
-
-# Adding Edges
-graph.add_edge(START,"searcher")
-
-graph.add_conditional_edges(
-    "searcher" ,
-     searcher_router , {
-        "search_tool" : "search_tool",
-        "extract_search_result" : "extract_search_result"
-    }
-)
-graph.add_edge("search_tool","searcher")
-graph.add_edge("extract_search_result","reader")
+# Adding edges
+graph.add_edge(START, "searcher")
 
 graph.add_conditional_edges(
-    "reader" ,
-     reader_router , {
-        "read_tool" : "read_tool",
-        "extract_read_result" : "extract_read_result"
-    }
+    "searcher",
+    searcher_router,
+    {
+        "search_tool": "search_tool",
+        "extract_search_result": "extract_search_result",
+    },
 )
-graph.add_edge("read_tool","reader")
-graph.add_edge("extract_read_result","writer")
+graph.add_edge("search_tool", "searcher")
+graph.add_edge("extract_search_result", "reader")
 
-graph.add_edge("writer","critic")
+graph.add_conditional_edges(
+    "reader",
+    reader_router,
+    {
+        "read_tool": "read_tool",
+        "extract_read_result": "extract_read_result",
+    },
+)
+graph.add_edge("read_tool", "reader")
+graph.add_edge("extract_read_result", "writer")
 
-graph.add_edge("critic",END)
+graph.add_edge("writer", "critic")
+
+graph.add_conditional_edges(
+    "critic",
+    critic_router,
+    {
+        "revise": "writer",
+        "end": END,
+    },
+)
 
 app = graph.compile()
 
-# testing
-initial_state = {
-    "topic": "Impact of AI agents on software development",
-    "messages": [],
-    "searcher": "",
-    "reader": "",
-    "writer": "",
-    "critic": ""
-}
 
-result = app.invoke(initial_state)
+if __name__ == "__main__":
+    initial_state = {
+        "topic": "Impact of AI agents on software development",
+        "messages": [],
+        "searcher": "",
+        "reader": "",
+        "writer": "",
+        "critic": "",
+        "is_approved": False,
+        "attempt": 0,
+        "search_attempts": 0,
+        "read_attempts": 0,
+        "reader_start": 0,
+    }
 
-print("\n" + "=" * 60)
-print("SEARCHER RESULTS")
-print("=" * 60)
-print(result["searcher"])
+    result = app.invoke(initial_state, config={"recursion_limit": 50})
 
-print("\n" + "=" * 60)
-print("READER RESULTS")
-print("=" * 60)
-print(result["reader"])
+    print("\n" + "=" * 60)
+    print("SEARCH RESULTS")
+    print("=" * 60)
+    print(result["searcher"])
 
-print("\n" + "=" * 60)
-print("WRITER")
-print("=" * 60)
-print(result["writer"])
+    print("\n" + "=" * 60)
+    print("RESEARCH / READER RESULTS")
+    print("=" * 60)
+    print(result["reader"])
+
+    print("\n" + "=" * 60)
+    print("FINAL REPORT")
+    print("=" * 60)
+    print(result["writer"])
+
+    print("\n" + "=" * 60)
+    print("FINAL CRITIC REVIEW")
+    print("=" * 60)
+    print(result["critic"])
+
+    print("\n" + "=" * 60)
+    print("WORKFLOW STATUS")
+    print("=" * 60)
+    print(f"Approved : {result['is_approved']}")
+    print(f"Attempts : {result['attempt']}")
