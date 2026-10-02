@@ -2,7 +2,7 @@
 import os
 from typing import TypedDict, Annotated
 from langgraph.graph.message import add_messages
-from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.prebuilt import ToolNode
 from langgraph.graph import StateGraph , START, END
 from langchain_groq import ChatGroq
 from langchain_core.messages import ToolMessage
@@ -133,6 +133,17 @@ def reader_router(state : State) :
 
     return "extract_read_result"
 
+def critic_node(state: State):
+    report = state["writer"]
+
+    messages = prompts.CRITIC_PROMPT.invoke({
+        "report": report
+    })
+
+    response = llm.invoke(messages)
+
+    return {"critic": response.content}
+
 # Graph Creation
 graph = StateGraph(State)
 
@@ -146,6 +157,8 @@ graph.add_node("read_tool",reader_tool_node)
 graph.add_node("extract_read_result",extract_reader_results_node)
 
 graph.add_node("writer",writer_node)
+
+graph.add_node("critic",critic_node)
 
 # Adding Edges
 graph.add_edge(START,"searcher")
@@ -169,6 +182,10 @@ graph.add_conditional_edges(
 )
 graph.add_edge("read_tool","reader")
 graph.add_edge("extract_read_result","writer")
+
+graph.add_edge("writer","critic")
+
+graph.add_edge("critic",END)
 
 app = graph.compile()
 
